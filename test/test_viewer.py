@@ -239,6 +239,78 @@ class CanViewerTest(unittest.TestCase):
         self.assertEqual(self.can_viewer.y, 2)
         self._assert_receive_statistics(expected)
 
+    def test_statistics_collected(self):
+        self._receive_statistics_fixture()
+        viewer = self.can_viewer
+        self.assertEqual(viewer.total_frames, 6)
+        self.assertEqual(viewer.error_frames, 0)
+        for entry in viewer.stats.values():
+            self.assertEqual(entry["count"], 2)
+            self.assertAlmostEqual(entry["dt_min"], 0.5)
+            self.assertAlmostEqual(entry["dt_max"], 0.5)
+        self.assertIn("Frames: 6", viewer.statistics_line())
+
+        viewer.draw_can_bus_message(
+            can.Message(timestamp=1.0, arbitration_id=0x7FF, is_error_frame=True)
+        )
+        self.assertEqual(viewer.error_frames, 1)
+
+        viewer.reset_statistics()
+        self.assertEqual((viewer.total_frames, viewer.stats), (0, {}))
+
+    def test_detail_lines(self):
+        viewer = self.can_viewer
+        for ts in (1.0, 1.5, 3.5):
+            viewer.draw_can_bus_message(
+                can.Message(
+                    timestamp=ts,
+                    arbitration_id=0x1ABCDE,
+                    is_extended_id=True,
+                    is_fd=True,
+                    bitrate_switch=True,
+                    data=b"Hi\x00\xff",
+                    channel="vcan0",
+                )
+            )
+        key = next(iter(viewer.ids))
+        text = "\n".join(viewer.detail_lines(key))
+        self.assertIn("0x001ABCDE", text)
+        self.assertIn("extended", text)
+        self.assertIn("CAN FD, BRS, no ESI", text)
+        self.assertIn("Hex:   48 69 00 FF", text)
+        self.assertIn("ASCII: Hi..", text)
+        self.assertIn("Channel: vcan0", text)
+        self.assertIn("Count: 3", text)
+        self.assertIn("dt min/avg/max: 0.500000/1.250000/2.000000s", text)
+
+    def test_detail_panel_selection_and_keys(self):
+        viewer = self.can_viewer
+        self._receive_statistics_fixture()
+        viewer.paused = True
+        self.stdscr_dummy.key_counter = 200
+        keys = [
+            ord("i"),
+            ord("\n"),
+            curses.KEY_DOWN,
+            curses.KEY_DOWN,
+            curses.KEY_UP,
+            curses.ascii.ESC,  # closes the panel only
+            ord("q"),
+        ]
+        with (
+            patch.object(self.stdscr_dummy, "getch", side_effect=keys),
+            patch("curses.is_term_resized", return_value=False),
+        ):
+            viewer.run()
+        self.assertTrue(viewer.show_statistics)
+        self.assertFalse(viewer.show_details)
+        # Selection moved down twice and up once from the first row
+        self.assertEqual(viewer.selected_key, viewer._ordered_keys()[1])
+
+    def test_enter_without_frames_does_nothing(self):
+        self.can_viewer.toggle_details()
+        self.assertFalse(self.can_viewer.show_details)
+
     def test_send(self):
         # CANopen EMCY
         data = [1, 2, 3, 4, 5, 6, 7]  # Wrong length

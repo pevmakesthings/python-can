@@ -39,7 +39,12 @@ There are several keyboard shortcuts that can be used with the viewer script, th
 * s - Sort the stored frames
 * h - Toggle highlighting of changed bytes in the data field - see the below image
 * SPACE - Pause the viewer
-* UP/DOWN - Scroll the viewer
+* i - Toggle a status line with bus-wide statistics (total frames, error frames, number of IDs and frame rate)
+* ENTER - Toggle a detail panel for the selected frame. It shows the ID (standard/extended), channel, frame type
+  (classic/CAN FD with BRS/ESI, remote or error frame), DLC and length, the full data as hex and ASCII, and per-ID
+  statistics (count, rate and minimum/average/maximum time between frames)
+* UP/DOWN - Scroll the viewer. While the detail panel is open they select the previous/next frame instead
+* ESCAPE - While the detail panel is open this closes it instead of quitting
 
 .. image:: images/viewer_changed_bytes_highlighting.png
     :width: 50%

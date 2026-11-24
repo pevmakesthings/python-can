@@ -65,6 +65,17 @@ class CanViewer:  # pylint: disable=too-many-instance-attributes
         self.highlight_changed_bytes = False
         self.previous_values = {}
 
+        # Statistics: per-ID timing/count information (kept apart from ``ids`` so
+        # it survives length changes), bus-wide totals and the detail panel state
+        self.stats = {}
+        self.total_frames = 0
+        self.error_frames = 0
+        self.stats_start = None
+        self.show_statistics = False
+        self.show_details = False
+        self.selected_key = None
+        self._last_footer_draw = 0.0
+
         # Get the window dimensions - used for resizing the window
         self.y, self.x = self.stdscr.getmaxyx()
 
@@ -100,6 +111,12 @@ class CanViewer:  # pylint: disable=too-many-instance-attributes
             # Read the terminal input
             key = self.stdscr.getch()
 
+            # ESC closes the detail panel first, otherwise it exits like 'q'
+            if key == KEY_ESC and self.show_details:
+                self.show_details = False
+                self.redraw_screen()
+                continue
+
             # Stop program if the user presses ESC or 'q'
             if key == KEY_ESC or key == ord("q"):
                 break
@@ -109,7 +126,17 @@ class CanViewer:  # pylint: disable=too-many-instance-attributes
                 self.ids = {}
                 self.start_time = None
                 self.scroll = 0
+                self.reset_statistics()
                 self.draw_header()
+
+            # Toggle the bus statistics line by pressing 'i'
+            elif key == ord("i"):
+                self.show_statistics = not self.show_statistics
+                self.redraw_screen()
+
+            # Toggle the detail panel by pressing enter
+            elif key in (curses.KEY_ENTER, 10, 13):
+                self.toggle_details()
 
             # Toggle byte change highlighting pressing 'h'
             elif key == ord("h"):
@@ -134,6 +161,10 @@ class CanViewer:  # pylint: disable=too-many-instance-attributes
             elif key == KEY_SPACE:
                 self.paused = not self.paused
 
+            # While the detail panel is open up/down change the selected frame
+            elif self.show_details and key in (curses.KEY_UP, curses.KEY_DOWN):
+                self.move_selection(-1 if key == curses.KEY_UP else 1)
+
             # Scroll by pressing up/down
             elif key == curses.KEY_UP:
                 # Limit scrolling, so the user do not scroll passed the header
@@ -144,6 +175,9 @@ class CanViewer:  # pylint: disable=too-many-instance-attributes
                 # Limit scrolling, so the maximum scrolling position is one below the last line
                 self.scroll += 1
                 self.redraw_screen()
+
+            # Keep the statistics line / detail panel up to date
+            self.draw_footer()
 
             # Check if screen was resized
             resized = curses.is_term_resized(self.y, self.x)
@@ -232,6 +266,7 @@ class CanViewer:  # pylint: disable=too-many-instance-attributes
 
             # Increment frame counter
             self.ids[key]["count"] += 1
+            self._update_statistics(key, msg)
 
         # Format the CAN-Bus ID as a hex value
         arbitration_id_string = (
@@ -256,7 +291,10 @@ class CanViewer:  # pylint: disable=too-many-instance-attributes
             color,
         )
         self.draw_line(self.ids[key]["row"], 23, f"{self.ids[key]['dt']:.6f}", color)
-        self.draw_line(self.ids[key]["row"], 35, arbitration_id_string, color)
+        id_color = color
+        if self.show_details and key == self.selected_key:
+            id_color = color | curses.A_REVERSE
+        self.draw_line(self.ids[key]["row"], 35, arbitration_id_string, id_color)
         self.draw_line(self.ids[key]["row"], 47, str(msg.dlc), color)
 
         try:
@@ -309,6 +347,161 @@ class CanViewer:  # pylint: disable=too-many-instance-attributes
 
         return self.ids[key]
 
+    def reset_statistics(self):
+        self.stats = {}
+        self.total_frames = 0
+        self.error_frames = 0
+        self.stats_start = None
+        self.selected_key = None
+        self.show_details = False
+
+    def _update_statistics(self, key, msg):
+        if self.stats_start is None:
+            self.stats_start = time.monotonic()
+        self.total_frames += 1
+        if msg.is_error_frame:
+            self.error_frames += 1
+
+        entry = self.stats.get(key)
+        if entry is None:
+            self.stats[key] = {
+                "first": msg.timestamp,
+                "last": msg.timestamp,
+                "dt_min": None,
+                "dt_max": None,
+                "dt_sum": 0.0,
+                "count": 1,
+            }
+            return
+        dt = msg.timestamp - entry["last"]
+        entry["last"] = msg.timestamp
+        entry["count"] += 1
+        entry["dt_sum"] += dt
+        entry["dt_min"] = dt if entry["dt_min"] is None else min(entry["dt_min"], dt)
+        entry["dt_max"] = dt if entry["dt_max"] is None else max(entry["dt_max"], dt)
+
+    def statistics_line(self) -> str:
+        """Bus-wide summary shown on the statistics line."""
+        elapsed = (
+            time.monotonic() - self.stats_start if self.stats_start is not None else 0.0
+        )
+        rate = self.total_frames / elapsed if elapsed > 0 else 0.0
+        return (
+            f"Frames: {self.total_frames}  Errors: {self.error_frames}  "
+            f"IDs: {len(self.ids)}  Rate: {rate:.1f} fps  Elapsed: {elapsed:.1f}s"
+            + ("  [PAUSED]" if self.paused else "")
+        )
+
+    def detail_lines(self, key) -> list[str]:
+        """Detailed description of the latest frame with the given key."""
+        entry = self.ids[key]
+        msg = entry["msg"]
+        stats = self.stats.get(key)
+
+        flags = []
+        if msg.is_error_frame:
+            flags.append("Error frame")
+        elif msg.is_remote_frame:
+            flags.append("Remote frame")
+        flags.append("CAN FD" if msg.is_fd else "Classic CAN")
+        if msg.is_fd:
+            flags.append("BRS" if msg.bitrate_switch else "no BRS")
+            flags.append("ESI" if msg.error_state_indicator else "no ESI")
+
+        id_kind = "extended" if msg.is_extended_id else "standard"
+        width = 8 if msg.is_extended_id else 3
+        lines = [
+            f"ID: 0x{msg.arbitration_id:0{width}X} ({msg.arbitration_id}, {id_kind})"
+            + (f"  Channel: {msg.channel}" if msg.channel is not None else ""),
+            f"Type: {', '.join(flags)}",
+            f"DLC: {msg.dlc}  Length: {len(msg.data)} bytes",
+            "Hex:   " + " ".join(f"{b:02X}" for b in msg.data),
+            "ASCII: " + "".join(chr(b) if 32 <= b < 127 else "." for b in msg.data),
+        ]
+        if stats is not None:
+            span = stats["last"] - stats["first"]
+            n_dt = stats["count"] - 1
+            if n_dt > 0:
+                avg = stats["dt_sum"] / n_dt
+                period = (
+                    f"dt min/avg/max: {stats['dt_min']:.6f}/{avg:.6f}/"
+                    f"{stats['dt_max']:.6f}s"
+                )
+                rate = f"  Rate: {n_dt / span:.1f} Hz" if span > 0 else ""
+            else:
+                period, rate = "dt min/avg/max: n/a", ""
+            lines.append(f"Count: {stats['count']}{rate}  {period}")
+        return lines
+
+    def _ordered_keys(self):
+        return sorted(self.ids, key=lambda k: self.ids[k]["row"])
+
+    def toggle_details(self):
+        if self.show_details:
+            self.show_details = False
+        else:
+            keys = self._ordered_keys()
+            if not keys:
+                return
+            if self.selected_key not in self.ids:
+                # Select the first visible frame
+                visible = [k for k in keys if self.ids[k]["row"] > self.scroll]
+                self.selected_key = (visible or keys)[0]
+            self.show_details = True
+        self.redraw_screen()
+
+    def move_selection(self, step):
+        keys = self._ordered_keys()
+        if not keys:
+            return
+        try:
+            index = keys.index(self.selected_key)
+        except ValueError:
+            index = 0
+        self.selected_key = keys[max(0, min(len(keys) - 1, index + step))]
+
+        # Scroll so the selected row stays visible above the panel
+        row = self.ids[self.selected_key]["row"]
+        visible_rows = max(1, self.y - 1 - self._footer_height())
+        if row <= self.scroll:
+            self.scroll = max(0, row - 1)
+        elif row > self.scroll + visible_rows:
+            self.scroll = row - visible_rows
+        self.redraw_screen()
+
+    def _footer_height(self):
+        height = 1 if self.show_statistics else 0
+        if self.show_details and self.selected_key in self.ids:
+            height += len(self.detail_lines(self.selected_key)) + 1
+        return height
+
+    def _draw_absolute(self, row, txt, *args):
+        # Footer rows are positioned relative to the window, not the scroll
+        if row < 0:
+            return
+        try:
+            self.stdscr.addstr(row, 0, txt.ljust(max(0, self.x - 1))[: self.x - 1], *args)
+        except curses.error:
+            pass
+
+    def draw_footer(self, force=False):
+        if not (self.show_statistics or self.show_details):
+            return
+        now = time.monotonic()
+        if not force and now - self._last_footer_draw < 0.2:
+            return
+        self._last_footer_draw = now
+
+        row = self.y - 1
+        if self.show_statistics:
+            self._draw_absolute(row, self.statistics_line(), curses.A_REVERSE)
+            row -= 1
+        if self.show_details and self.selected_key in self.ids:
+            lines = self.detail_lines(self.selected_key)
+            for offset, line in enumerate(reversed(lines)):
+                self._draw_absolute(row - offset, line)
+            self._draw_absolute(row - len(lines), "-" * (self.x - 1), curses.A_BOLD)
+
     def draw_line(self, row, col, txt, *args):
         if row - self.scroll < 0:
             # Skip if we have scrolled past the line
@@ -341,6 +534,7 @@ class CanViewer:  # pylint: disable=too-many-instance-attributes
         self.draw_header()
         for ids in self.ids.values():
             self.draw_can_bus_message(ids["msg"], sorting=True)
+        self.draw_footer(force=True)
 
 
 class SmartFormatter(argparse.HelpFormatter):
@@ -403,8 +597,10 @@ def _parse_viewer_args(
         "\n        | c       | Clear the stored frames       |"
         "\n        | s       | Sort the stored frames        |"
         "\n        | h       | Toggle highlight byte changes |"
+        "\n        | i       | Toggle bus statistics line    |"
+        "\n        | ENTER   | Toggle frame detail panel     |"
         "\n        | SPACE   | Pause the viewer              |"
-        "\n        | UP/DOWN | Scroll the viewer             |"
+        "\n        | UP/DOWN | Scroll / select frame         |"
         "\n        +---------+-------------------------------+",
         formatter_class=SmartFormatter,
         add_help=False,
